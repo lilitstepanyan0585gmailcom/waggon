@@ -3,8 +3,9 @@ import time
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm, ticker
-from scipy.optimize import minimize
+import math
+import random
+from matplotlib import  ticker
 from joblib import Parallel, delayed
 
 from .base import Optimiser
@@ -92,10 +93,71 @@ class SurrogateOptimiser(Optimiser):
             self.surr.verbose   = self.verbose
     
     
-    def run_lbfgsb(self, x0):
-        opt_res = minimize(method='L-BFGS-B', fun=self.acqf, x0=x0, bounds=self.func.domain, tol=self.num_opt_tol, options={'disp': self.num_opt_disp})
-        return opt_res.fun, opt_res.x
-    
+    def _scalar_acqf(self, x):
+        v = self.acqf(np.asarray(x, dtype=float))
+        try:
+            return float(v)
+        except Exception:
+            if hasattr(v, "item"):
+                return float(v.item())
+            return float(np.asarray(v).reshape(()))
+
+    def _reflect_into_bounds(self, x):
+        x = np.asarray(x, dtype=float).copy()
+        bounds = np.asarray(self.func.domain, dtype=float)
+        for i, (lo, hi) in enumerate(bounds):
+            span = hi - lo
+            if span <= 0:
+                x[i] = lo
+                continue
+            t = (x[i] - lo) % (2*span)
+            x[i] = lo + (t if t <= span else 2*span - t)
+        return x
+
+    def metropolis(self, x0, n_samples=10_000, prop_scale=0.1, burn=1_000, seed=None):
+        """
+        Random-walk Metropolis для МИНИМИЗАЦИИ self.acqf.
+        Возвращает (samples, acc_rate, best_x, best_val)
+        """
+        if seed is not None:
+            random.seed(seed)
+
+        x = np.array(x0, dtype=float).reshape(-1)
+        d = x.shape[0]
+        # нормализуем prop_scale
+        ps = np.full(d, float(prop_scale), dtype=float) if np.isscalar(prop_scale) \
+            else np.asarray(prop_scale, dtype=float).reshape(-1)
+
+        samples, accepts = [], 0
+        total = int(n_samples) + int(burn)
+
+        def energy(z):  # минимизируем acqf → энергия = acqf
+            return self._scalar_acqf(z)
+
+        e_cur = energy(x)
+        best_x, best_val = x.copy(), e_cur
+
+        for it in range(total):
+            x_prop = x + np.array([random.gauss(0.0, ps[i]) for i in range(d)], dtype=float)
+            x_prop = self._reflect_into_bounds(x_prop)
+
+            lp_cur  = -e_cur
+            e_prop  = energy(x_prop)
+            lp_prop = -e_prop
+
+            if math.log(random.random()) < (lp_prop - lp_cur):
+                x, e_cur = x_prop, e_prop
+                accepts += 1
+                if e_cur < best_val:
+                    best_x, best_val = x.copy(), e_cur
+
+            if it >= burn:
+                samples.append(x.copy())
+
+        acc_rate = accepts / max(1, total)
+        samples = np.array(samples) if samples else np.empty((0, d))
+        return samples, acc_rate, best_x, best_val
+
 
     def numerical_search(self, x0=None):
         '''
@@ -126,33 +188,46 @@ class SurrogateOptimiser(Optimiser):
             else:
                 candidates = inter_conds
         
+        n_samples  = getattr(self, "mcmc_n_samples", 10_000)
+        burn       = getattr(self, "mcmc_burn",      1_000)
+        prop_scale = getattr(self, "mcmc_prop_scale", 0.1)
+        seed       = getattr(self, "mcmc_seed",      None)
+
         if self.parallel in [0, 1]:
-
-            for i, x0 in enumerate(candidates):
-                
-                if (self.eq_cons is None) and (self.ineq_cons is None):
-                    opt_res = minimize(method='L-BFGS-B', fun=self.acqf, x0=x0, bounds=self.func.domain, tol=self.num_opt_tol, options={'disp': self.num_opt_disp})
-                else:
-                    opt_res = minimize(method='SLSQP', fun=self.acqf, x0=x0, bounds=self.func.domain, constraints=[self.eq_cons, self.ineq_cons])
-                
-                if i == 0:
-                    best_x = opt_res.x
-                    best_acqf = opt_res.fun
-                else:
-                    if opt_res.fun < best_acqf:
-                        best_acqf = opt_res.fun
-                        best_x = opt_res.x
-            
+            best_x, best_val = None, np.inf
+            for i, start in enumerate(candidates):
+                # Metropolis минимизирует self.acqf
+                _, _, bx, bval = self.metropolis(
+                    start,
+                    n_samples=n_samples,
+                    prop_scale=prop_scale,
+                    burn=burn,
+                    seed=None if seed is None else (seed + i),
+                )
+                if i == 0 or bval < best_val:
+                    best_x, best_val = bx, bval
             return best_x
-        
+
         else:
+            def _one_run(idx, start):
+                _, _, bx, bval = self.metropolis(
+                    start,
+                    n_samples=n_samples,
+                    prop_scale=prop_scale,
+                    burn=burn,
+                    seed=None if seed is None else (seed + idx),
+                )
+                return (bval, bx)
 
-            r = Parallel(n_jobs=self.parallel, prefer="threads")(delayed(self.run_lbfgsb)(x0) for x0 in candidates)
-            f, x = zip(*r)
-            f, x = np.array(f), np.array(x)
+            r = Parallel(n_jobs=self.parallel, prefer="threads")(
+                delayed(_one_run)(i, s) for i, s in enumerate(candidates)
+            )
+            bvals, bxs = zip(*r)
+            bvals, bxs = np.array(bvals), np.array(bxs, dtype=float)
+            return bxs[np.argmin(bvals)]
 
-            return x[np.argmin(f)]
-    
+            
+         
 
     def predict(self, X, y):
         '''
@@ -181,16 +256,7 @@ class SurrogateOptimiser(Optimiser):
         self.acqf.surr = self.surr
             
         next_x = self.numerical_search(x0=X[np.argmin(y)])
-
-        if np.any(np.linalg.norm(X - next_x, axis=-1) < 1e-6):
-            next_x = np.repeat(next_x.reshape(1, -1), self.num_opt_candidates, axis=0)
-            next_x += np.random.normal(0, self.eps, next_x.shape)
-            next_x = next_x[np.argmin(self.acqf(next_x))]
-        
-        if hasattr(self, "clear_surr") and self.clear_surr:
-            del self.acqf.surr
-            gc.collect()
-        
+    
         return np.array([next_x])
     
     
